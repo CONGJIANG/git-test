@@ -1,0 +1,516 @@
+### reference model and alternative specifications
+library(dplyr)
+library(fixest)
+library(splines)
+
+data <- readRDS("/Users/cjiang/Downloads/mortality_PMCO31072025.RDS")
+data_sex_uwet <- readRDS("/Users/cjiang/Downloads/mortality_PMCO_unweighted_means_31072025.RDS")
+data <- readRDS("/Users/cjiang/Downloads/MortalityPM_05082025.RDS")
+
+
+# For the aggregation
+data <- data_sex_uwet %>%
+  group_by(District, year, month) %>%
+  summarise(across(everything(), ~ if (is.numeric(.x)) {
+    sum(.x, na.rm = TRUE)
+  } else {
+    paste(unique(.x), collapse = ", ")
+  }), .groups = "drop")
+
+
+data$mean_sp_hPa # surface pressure
+
+str(data)      # Structure of the object
+summary(data)  # Summary statistics
+head(data)     # First few rows (if it's a data frame)
+
+
+data$mean_t2m_c
+data$AggregatedDeath
+
+### (1) run the reference model (Model 0)
+model_PM25_0 <- feglm(
+  AggregatedDeath ~ PM25_pred + ns(mean_t2m_c, df=3) | District + year,
+  data = data,
+  offset = log(data$Population_2022),
+  vcov = "iid",
+  family = "quasipoisson"
+)
+
+summary(model_PM25_0)
+
+
+library(fixest)
+library(dplyr)
+library(splines)
+
+# ----------------------------
+# Define fixed effects
+# ----------------------------
+FEs <- c(
+  "District + year",                          # baseline
+  "District + month",                         # seasonal variation
+  "District + year + month",                  # add month to control seasonality
+  "Division + year",                          # coarser geography
+  "Division + month",
+  "Division + year + month",
+  "District + year^month",                    # interaction of year and month (non-additive)
+  "District^year",                            # district-specific yearly trends
+  "District^month",                           # district-specific monthly trends
+  "District + District^year",                 # additive FE + interaction
+  "District + District^month",
+  "District + year + District^month",         # month interaction nested within district
+  "District + year + Division^month",         # control for within-division month variation
+  "District + year + Division^year",          # division-year interactions
+  "District + year + Division^year + Division^month",
+  "Division + District + year",               # nested geography
+  "Division + District + year + month",
+  "Division + District + year^month",         # full geographic + time interaction
+  "District + year + month + District^year",  # season + district-specific trend
+  "District + year + month + Division^year",  # district + division-year trend
+  "District + year + month + District^month",
+  "District + year + month + Division^month",
+  "District + year + month + District^year + District^month"
+)
+
+# ----------------------------
+# Run for each FE specification
+# ----------------------------
+run_combined_model_and_placebos <- function(data,
+                                            outcome = "AggregatedDeath",
+                                            exposure = "PM25_pred",
+                                            covariates = "ns(mean_t2m_c, df=3)",
+                                            offset_var = "Population_2022",
+                                            n_perm = 500,
+                                            seed = 88) {
+  results <- list()
+
+  for (i in seq_along(FEs)) {
+    fe_term <- FEs[i]
+    formula_str <- paste0(outcome, " ~ ", exposure, " + ", covariates, " | ", fe_term)
+    formula_obj <- as.formula(formula_str)
+
+    message("Fitting FE model ", i, ": ", fe_term)
+    model_true <- feglm(
+      fml = formula_obj,
+      data = data,
+      offset = log(data[[offset_var]]),
+      family = "quasipoisson",
+      vcov = "iid"
+    )
+
+    obs_coef <- coef(model_true)[exposure]
+
+    # ----------------- Spatial Randomization -----------------
+    set.seed(seed + i)
+    spatial_null <- numeric(n_perm)
+    for (p in 1:n_perm) {
+      data_perm <- data %>%
+        group_by(year, month) %>%
+        mutate(PERM_EXPOSURE = sample(.data[[exposure]])) %>%
+        ungroup()
+
+      model_perm <- feglm(
+        as.formula(paste0(outcome, " ~ PERM_EXPOSURE + ", covariates, " | ", fe_term)),
+        data = data_perm,
+        offset = log(data_perm[[offset_var]]),
+        family = "quasipoisson"
+      )
+
+      spatial_null[p] <- coef(model_perm)["PERM_EXPOSURE"]
+    }
+
+    p_spatial <- mean(abs(spatial_null) >= abs(obs_coef))
+
+    # ----------------- Temporal Randomization -----------------
+    temporal_null <- numeric(n_perm)
+    for (p in 1:n_perm) {
+      data_perm <- data %>%
+        group_by(District, Division) %>%
+        mutate(PERM_EXPOSURE = sample(.data[[exposure]])) %>%
+        ungroup()
+
+      model_perm <- feglm(
+        as.formula(paste0(outcome, " ~ PERM_EXPOSURE + ", covariates, " | ", fe_term)),
+        data = data_perm,
+        offset = log(data_perm[[offset_var]]),
+        family = "quasipoisson"
+      )
+
+      temporal_null[p] <- coef(model_perm)["PERM_EXPOSURE"]
+    }
+
+    p_temporal <- mean(abs(temporal_null) >= abs(obs_coef))
+
+    # Save result
+    results[[i]] <- list(
+      fe = fe_term,
+      fml = formula_str,
+      model = model_true,
+      coef = obs_coef,
+      p_spatial = p_spatial,
+      p_temporal = p_temporal
+    )
+  }
+
+  # Convert to summary table
+  summary_df <- dplyr::bind_rows(lapply(results, function(r) {
+    tibble::tibble(
+      fixed_effect = r$fe,
+      estimate = r$coef,
+      p_spatial = r$p_spatial,
+      p_temporal = r$p_temporal
+    )
+  }))
+
+  return(list(
+    summary_table = summary_df,
+    models = results
+  ))
+}
+
+
+
+res <- run_combined_model_and_placebos(data = data,
+                                       outcome = "AggregatedDeath",
+                                       exposure = "PM25_pred",
+                                       covariates = "ns(mean_t2m_c, df=3)",
+                                       offset_var = "Population_2022",
+                                       n_perm = 500)
+
+# Print summary table
+print(res$summary_table)
+
+# View best model
+which_best <- which.max(res$summary_table$estimate)
+res$summary_table[5,]
+res$models[[which_best]]$model
+(top5_rows <- res$summary_table[order(res$summary_table$estimate, decreasing = TRUE)[1:5], ])
+
+
+# Exposure selection
+# weighted
+#PM25_vars <- c("PM25_pred", "PM25_Satellite", "mean_PM25_pred", "mean_PM25_ensemble")
+# unweighted
+PM25_vars <- c("PM25_pred", "mean_PM25_pred", "mean_PM25_ensemble", "mean_PM25ug")
+
+formulas <- c()
+for (pm in PM25_vars) {
+    formulas <- c(formulas, paste0(
+      "AggregatedDeath ~ ", pm, " + ns(mean_t2m_c, df=3) ",
+      " | Division + month"
+    ))
+}
+formulas
+
+# Fit models
+models_list <- list()
+for (i in seq_along(formulas)) {
+  formula.i <- as.formula(formulas[i])
+  models_list[[i]] <- feglm(
+    formula.i,
+    data = data,
+    offset = log(data$Population_2022),
+    vcov = "iid",
+    family = "quasipoisson"
+  )
+}
+
+
+# Extract and print coefficients for each variable
+pm25_effects1 <- lapply(PM25_vars, function(var) {
+  coefs <- sapply(models_list, function(m) coef(m)[var])
+  names(coefs) <- names(models_list)
+  print(paste("Effects for", var))
+  print(coefs)
+  return(coefs)
+})
+
+# Optionally name the list for easier reference
+names(pm25_effects1) <- PM25_vars
+pm25_effects1
+formulas[1]
+
+
+####### Sensitivity Analysis
+### (1) models with different temperature adjustments (Model 0, Models 2-1 to 2-4)
+TEMPs <- c("mean_t2m_c",
+           "",
+           "ns(mean_t2m_c, df=1)",
+           "ns(mean_t2m_c, df=2)",
+           "ns(mean_t2m_c, df=3)",
+           "ns(mean_t2m_c, df=4)",
+           "ns(mean_t2m_c, df=5)",
+           "ns(mean_t2m_c, df=6)"
+)
+formulas <- c(paste0("AggregatedDeath ~ PM25_pred +",
+                     TEMPs,
+                     "| Division + month"))
+formulas[2] <- "AggregatedDeath ~ PM25_pred | Division + month"
+
+
+models_list <- list()
+for (i in seq_along(formulas)) {
+  formula.i <- as.formula(formulas[i])
+  models_list[[i]] <- feglm(formula.i,
+                            data = data,
+                            offset = log(data$Population_2022),
+                            family = "quasipoisson",
+                            vcov = "iid")
+}
+
+pm25_effects <- sapply(models_list, function(m) coef(m)["PM25_pred"])
+print(pm25_effects)
+
+which.max(pm25_effects)
+formulas[4]
+models_list[4]
+# best PM25_pred         0.002207
+
+
+data$mean_RH
+### (2) models with different RH adjustments (Model 0, Models 2-1 to 2-4)
+RHs <- c("mean_RH",
+         "",
+         "ns(mean_RH, df=1)",
+         "ns(mean_RH, df=2)",
+         "ns(mean_RH, df=3)",
+         "ns(mean_RH, df=4)",
+         "ns(mean_RH, df=5)",
+         "ns(mean_RH, df=6)"
+)
+formulas <- c(paste0("AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +",
+                     RHs,
+                     "| Division + month"))
+formulas[2] <- "AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2)| Division + month"
+
+
+models_list <- list()
+for (i in seq_along(formulas)) {
+  formula.i <- as.formula(formulas[i])
+  models_list[[i]] <- feglm(formula.i,
+                            data = data,
+                            offset = log(data$Population_2022),
+                            family = "quasipoisson",
+                            vcov = "iid")
+}
+
+pm25_effects <- sapply(models_list, function(m) coef(m)["PM25_pred"])
+print(pm25_effects)
+
+which.max(pm25_effects)
+formulas[3]
+models_list[3]
+# PM25_pred         0.003252
+
+
+data$mean_wind_speed
+### (3) models with different wind_speed adjustments (Model 0, Models 2-1 to 2-4)
+wind_speeds <- c("mean_wind_speed",
+                 "",
+                 "ns(mean_wind_speed, df=1)",
+                 "ns(mean_wind_speed, df=2)",
+                 "ns(mean_wind_speed, df=3)",
+                 "ns(mean_wind_speed, df=4)",
+                 "ns(mean_wind_speed, df=5)",
+                 "ns(mean_wind_speed, df=6)"
+)
+formulas <- c(paste0("AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +",
+                     wind_speeds,
+                     "| Division + month"))
+formulas[2] <- "AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1)| Division + month"
+
+
+models_list <- list()
+for (i in seq_along(formulas)) {
+  formula.i <- as.formula(formulas[i])
+  models_list[[i]] <- feglm(formula.i,
+                            data = data,
+                            offset = log(data$Population_2022),
+                            family = "quasipoisson",
+                            vcov = "iid")
+}
+
+pm25_effects <- sapply(models_list, function(m) coef(m)["PM25_pred"])
+print(pm25_effects)
+
+which.max(pm25_effects)
+formulas[5]
+models_list[5]
+#PM25_pred          0.002299
+
+data$mean_OrganicC
+data$OrganicC
+### (3) models with different AOD adjustments (Model 0, Models 2-1 to 2-4)
+OrganicC_zs <- c("mean_OrganicC",
+                 "",
+                 "ns(mean_OrganicC, df=1)",
+                 "ns(mean_OrganicC, df=2)",
+                 "ns(mean_OrganicC, df=3)",
+                 "ns(mean_OrganicC, df=4)",
+                 "ns(mean_OrganicC, df=5)",
+                 "ns(mean_OrganicC, df=6)"
+)
+
+formulas <- c(paste0("AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +ns(mean_wind_speed, df=3)+",
+                     OrganicC_zs,
+                     "| Division + month"))
+formulas[2] <- "AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +ns(mean_wind_speed, df=3)| Division + month"
+
+
+models_list <- list()
+for (i in seq_along(formulas)) {
+  formula.i <- as.formula(formulas[i])
+  models_list[[i]] <- feglm(formula.i,
+                            data = data,
+                            offset = log(data$Population_2022),
+                            family = "quasipoisson",
+                            vcov = "iid")
+}
+
+pm25_effects <- sapply(models_list, function(m) coef(m)["PM25_pred"])
+print(pm25_effects)
+
+which.max(pm25_effects)
+formulas[1]
+models_list[1]
+
+
+
+
+model_PM25_final <- feglm(
+  AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +ns(mean_wind_speed, df=3)+mean_OrganicC| Division + month,
+  data = data,
+  offset = log(data$Population_2022),
+  vcov = "iid",
+  family = "quasipoisson"
+)
+
+summary(model_PM25_final)
+
+run_placebo_tests <- function(data,
+                              outcome = "AggregatedDeath",
+                              exposure = "PM25_pred",
+                              covariates = "ns(mean_t2m_c, df=3)",
+                              offset_var = "Population_2022",
+                              fe = "District + year",
+                              n_perm = 1000,
+                              seed = 123) {
+
+  library(fixest)
+  library(dplyr)
+
+  set.seed(seed)
+
+  # ----------------------
+  # Step 1: Fit original model
+  # ----------------------
+  formula_str <- paste0(outcome, " ~ ", exposure, " + ", covariates, " | ", fe)
+  formula_obj <- as.formula(formula_str)
+
+  message("Fitting original model...")
+  model_true <- feglm(
+    fml = formula_obj,
+    data = data,
+    offset = log(data[[offset_var]]),
+    family = "quasipoisson"
+  )
+
+  obs_coef <- coef(model_true)[exposure]
+
+  # ----------------------
+  # Step 2: Spatial randomization
+  # ----------------------
+  message("Running spatial randomization...")
+  spatial_null <- numeric(n_perm)
+
+  for (i in 1:n_perm) {
+    data_perm <- data %>%
+      group_by(year, month) %>%
+      mutate(PERM_EXPOSURE = sample(.data[[exposure]])) %>%
+      ungroup()
+
+    model_perm <- feglm(
+      as.formula(paste0(outcome, " ~ PERM_EXPOSURE + ", covariates, " | ", fe)),
+      data = data_perm,
+      offset = log(data_perm[[offset_var]]),
+      family = "quasipoisson"
+    )
+
+    spatial_null[i] <- coef(model_perm)["PERM_EXPOSURE"]
+  }
+
+  # ----------------------
+  # Step 3: Temporal randomization
+  # ----------------------
+  message("Running temporal randomization...")
+  temporal_null <- numeric(n_perm)
+
+  for (i in 1:n_perm) {
+    data_perm <- data %>%
+      group_by(District, Division) %>%
+      mutate(PERM_EXPOSURE = sample(.data[[exposure]])) %>%
+      ungroup()
+
+    model_perm <- feglm(
+      as.formula(paste0(outcome, " ~ PERM_EXPOSURE + ", covariates, " | ", fe)),
+      data = data_perm,
+      offset = log(data_perm[[offset_var]]),
+      family = "quasipoisson"
+    )
+
+    temporal_null[i] <- coef(model_perm)["PERM_EXPOSURE"]
+  }
+
+  # ----------------------
+  # Step 4: Plot results
+  # ----------------------
+  par(mfrow = c(1, 2))
+  hist(spatial_null, breaks = 50, main = "Spatial Randomization Null", col = "lightgray",
+       xlab = "PM2.5 effect", border = "white")
+  abline(v = obs_coef, col = "red", lwd = 2)
+
+  hist(temporal_null, breaks = 50, main = "Temporal Randomization Null", col = "lightgray",
+       xlab = "PM2.5 effect", border = "white")
+  abline(v = obs_coef, col = "red", lwd = 2)
+  par(mfrow = c(1, 1))
+
+  # ----------------------
+  # Step 5: Return summary
+  # ----------------------
+  p_spatial <- mean(abs(spatial_null) >= abs(obs_coef))
+  p_temporal <- mean(abs(temporal_null) >= abs(obs_coef))
+
+  return(list(
+    observed_coef = obs_coef,
+    p_spatial = p_spatial,
+    p_temporal = p_temporal,
+    spatial_null = spatial_null,
+    temporal_null = temporal_null
+  ))
+}
+
+formulas[1]
+#AggregatedDeath ~ PM25_pred +ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +ns(mean_wind_speed, df=3)+mean_OrganicC| Division + month
+
+result <- run_placebo_tests(
+  data = data,
+  outcome = "AggregatedDeath",
+  exposure = "PM25_pred",
+  covariates = "ns(mean_t2m_c, df=2) +ns(mean_RH, df=1) +ns(mean_wind_speed, df=3)+mean_OrganicC",
+  offset_var = "Population_2022",
+  fe = "Division + month",
+  n_perm = 500  # You can use 1000 or 2000 for real analysis
+)
+
+result$p_spatial
+result$p_temporal
+
+#If both p_spatial and p_temporal are small (e.g., < 0.05), it supports that the observed PM2.5 effect is unlikely due to spatial/temporal structure alone.
+#If they are large, the observed association might reflect model misspecification or autocorrelation.
+
+
+
+
+
+
